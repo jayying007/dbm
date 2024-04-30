@@ -42,21 +42,24 @@ typedef struct {
     int idxfd; /* fd for index file */
     int datfd; /* fd for data file */
     char *idxbuf; /* malloc'ed buffer for index record */
-    char *datbuf; /* malloc'ed buffer for data record*/
+    char *datbuf; /* malloc'ed buffer for data record */
     char *name; /* name db was opened under */
-    off_t idxoff; /* offset in index file of index record */
-    /* key is at (idxoff + PTR_SZ + IDXLEN_SZ) */
-    size_t idxlen; /* length of index record */
-    /* excludes IDXLEN_SZ bytes at front of record */
-    /* includes newline at end of index record */
+    /* offset in index file of index record(这条索引记录的偏移量)
+       key is at (idxoff + PTR_SZ + IDXLEN_SZ) */
+    off_t idxoff;
+    /* length of index record(索引记录长度)
+       excludes IDXLEN_SZ bytes at front of record
+       includes newline at end of index record */
+    size_t idxlen;
     off_t datoff; /* offset in data file of data record */
-    size_t datlen; /* length of data record */
-    /* includes newline at end */
+    /* length of data record
+       includes newline at end */
+    size_t datlen;
     off_t ptrval; /* contents of chain ptr in index record */
     off_t ptroff; /* chain ptr offset pointing to this idx record */
-    off_t chainoff; /* offset of hash chain for this index record */
-    off_t hashoff; /* offset in index file of hash table */
-    DBHASH nhash; /* current hash table size */
+    off_t chainoff; /* offset of hash chain for this index record 键的hash值在散列表中的位置+hashoff */
+    off_t hashoff; /* offset in index file of hash table 散列表起始位置的文件偏移量 */
+    DBHASH nhash; /* current hash table size 散列表的大小 */
 
     COUNT cnt_delok; /* delete OK */
     COUNT cnt_delerr; /* delete error */
@@ -74,10 +77,10 @@ typedef struct {
  * Internal functions.
  */
 static DB *_db_alloc(int);
+static void _db_free(DB *);
 static void _db_dodelete(DB *);
 static int _db_find_and_lock(DB *, const char *, int);
 static int _db_findfree(DB *, int, int);
-static void _db_free(DB *);
 static DBHASH _db_hash(DB *, const char *);
 static char *_db_readdat(DB *);
 static off_t _db_readidx(DB *, off_t);
@@ -85,6 +88,8 @@ static off_t _db_readptr(DB *, off_t);
 static void _db_writedat(DB *, const char *, off_t, int);
 static void _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void _db_writeptr(DB *, off_t, off_t);
+
+#pragma mark - Public
 
 /*
  * Open or create a database.  Same arguments as open(2).
@@ -140,16 +145,19 @@ DBHANDLE db_open(const char *pathname, int oflag, ...) {
          * it.  Write lock the entire file so that we can stat
          * it, check its size, and initialize it, atomically.
          */
-        if (writew_lock(db->idxfd, 0, SEEK_SET, 0) < 0)
+        if (writew_lock(db->idxfd, 0, SEEK_SET, 0) < 0) {
             err_dump("db_open: writew_lock error");
+        }
 
         struct stat statbuff;
-        if (fstat(db->idxfd, &statbuff) < 0)
+        if (fstat(db->idxfd, &statbuff) < 0) {
             err_sys("db_open: fstat error");
+        }
 
         if (statbuff.st_size == 0) {
             char asciiptr[PTR_SZ + 1], hash[(NHASH_DEF + 1) * PTR_SZ + 2]; /* +2 for newline and null */
             /*
+             * 初始化 空闲链表、散列表
              * We have to build a list of (NHASH_DEF + 1) chain
              * ptrs with a value of 0.  The +1 is for the free
              * list pointer that precedes the hash table.
@@ -164,8 +172,9 @@ DBHANDLE db_open(const char *pathname, int oflag, ...) {
                 err_dump("db_open: index file init write error");
         }
 
-        if (un_lock(db->idxfd, 0, SEEK_SET, 0) < 0)
+        if (un_lock(db->idxfd, 0, SEEK_SET, 0) < 0) {
             err_dump("db_open: un_lock error");
+        }
     }
 
     db_rewind(db);
@@ -227,8 +236,8 @@ int db_store(DBHANDLE h, const char *key, const char *data, int flag) {
              */
             _db_writedat(db, data, 0, SEEK_END);
             _db_writeidx(db, key, 0, SEEK_END, ptrval);
-
             /*
+             * 新的索引记录指向了之前的记录(头插法)，这里要更新散列表的头部为新的索引记录的偏移量
              * db->idxoff was set by _db_writeidx.  The new
              * record goes to the front of the hash chain.
              */
@@ -517,6 +526,67 @@ static int _db_find_and_lock(DB *db, const char *key, int writelock) {
 }
 
 /*
+ * Try to find a free index record and accompanying data record
+ * of the correct sizes.  We're only called by db_store.
+ */
+static int _db_findfree(DB *db, int keylen, int datlen) {
+    int rc;
+    off_t offset, nextoffset, saveoffset;
+
+    /*
+     * Lock the free list.
+     */
+    if (writew_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0) {
+        err_dump("_db_findfree: writew_lock error");
+    }
+
+    /*
+     * Read the free list pointer.
+     */
+    saveoffset = FREE_OFF;
+    offset = _db_readptr(db, saveoffset);
+
+    while (offset != 0) {
+        nextoffset = _db_readidx(db, offset);
+        if (strlen(db->idxbuf) == keylen && db->datlen == datlen) {
+            break; /* found a match */
+        }
+        saveoffset = offset;
+        offset = nextoffset;
+    }
+
+    if (offset == 0) {
+        rc = -1; /* no match found */
+    } else {
+        /*
+         * Found a free record with matching sizes.
+         * The index record was read in by _db_readidx above,
+         * which sets db->ptrval.  Also, saveoffset points to
+         * the chain ptr that pointed to this empty record on
+         * the free list.  We set this chain ptr to db->ptrval,
+         * which removes the empty record from the free list.
+         */
+        _db_writeptr(db, saveoffset, db->ptrval);
+        rc = 0;
+
+        /*
+         * Notice also that _db_readidx set both db->idxoff
+         * and db->datoff.  This is used by the caller, db_store,
+         * to write the new index record and data record.
+         */
+    }
+
+    /*
+     * Unlock the free list.
+     */
+    if (un_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0) {
+        err_dump("_db_findfree: un_lock error");
+    }
+
+    return (rc);
+}
+
+/*
  * Calculate the hash value for a key.
  */
 static DBHASH _db_hash(DB *db, const char *key) {
@@ -570,7 +640,7 @@ static void _db_writeptr(DB *db, off_t offset, off_t ptrval) {
     }
 }
 
-/*
+/* 从offset读取一条索引记录，并返回下一条的offset
  * Read the next index record.  We start at the specified offset
  * in the index file.  We read the index record into db->idxbuf
  * and replace the separators with null bytes.  If all is OK we
@@ -766,67 +836,6 @@ static void _db_writedat(DB *db, const char *data, off_t offset, int whence) {
 }
 
 /*
- * Try to find a free index record and accompanying data record
- * of the correct sizes.  We're only called by db_store.
- */
-static int _db_findfree(DB *db, int keylen, int datlen) {
-    int rc;
-    off_t offset, nextoffset, saveoffset;
-
-    /*
-     * Lock the free list.
-     */
-    if (writew_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0) {
-        err_dump("_db_findfree: writew_lock error");
-    }
-
-    /*
-     * Read the free list pointer.
-     */
-    saveoffset = FREE_OFF;
-    offset = _db_readptr(db, saveoffset);
-
-    while (offset != 0) {
-        nextoffset = _db_readidx(db, offset);
-        if (strlen(db->idxbuf) == keylen && db->datlen == datlen) {
-            break; /* found a match */
-        }
-        saveoffset = offset;
-        offset = nextoffset;
-    }
-
-    if (offset == 0) {
-        rc = -1; /* no match found */
-    } else {
-        /*
-         * Found a free record with matching sizes.
-         * The index record was read in by _db_readidx above,
-         * which sets db->ptrval.  Also, saveoffset points to
-         * the chain ptr that pointed to this empty record on
-         * the free list.  We set this chain ptr to db->ptrval,
-         * which removes the empty record from the free list.
-         */
-        _db_writeptr(db, saveoffset, db->ptrval);
-        rc = 0;
-
-        /*
-         * Notice also that _db_readidx set both db->idxoff
-         * and db->datoff.  This is used by the caller, db_store,
-         * to write the new index record and data record.
-         */
-    }
-
-    /*
-     * Unlock the free list.
-     */
-    if (un_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0) {
-        err_dump("_db_findfree: un_lock error");
-    }
-
-    return (rc);
-}
-
-/*
  * Delete the current record specified by the DB structure.
  * This function is called by db_delete and db_store, after
  * the record has been located by _db_find_and_lock.
@@ -860,17 +869,17 @@ static void _db_dodelete(DB *db) {
     _db_writedat(db, db->datbuf, db->datoff, SEEK_SET);
 
     /*
+     * Save the contents of index record chain ptr,
+     * before it's rewritten by _db_writeidx.
+     */
+    saveptr = db->ptrval;
+
+    /* 下面三条语句 释放了一块索引记录，并用头插法插到空闲链表中
      * Read the free list pointer.  Its value becomes the
      * chain ptr field of the deleted index record.  This means
      * the deleted record becomes the head of the free list.
      */
     freeptr = _db_readptr(db, FREE_OFF);
-
-    /*
-     * Save the contents of index record chain ptr,
-     * before it's rewritten by _db_writeidx.
-     */
-    saveptr = db->ptrval;
 
     /*
      * Rewrite the index record.  This also rewrites the length
@@ -884,7 +893,8 @@ static void _db_dodelete(DB *db) {
      */
     _db_writeptr(db, FREE_OFF, db->idxoff);
 
-    /*
+    /* 将B从链表 A --> B --> C 中摘除。
+     * 此处db->ptroff指向索引记录A，saveptr指向索引记录C。这里的操作将索引记录A的下一个链表地址(在开头)指向了索引记录C的位置。
      * Rewrite the chain ptr that pointed to this record being
      * deleted.  Recall that _db_find_and_lock sets db->ptroff to
      * point to this chain ptr.  We set this chain ptr to the
